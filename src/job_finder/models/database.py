@@ -1,0 +1,262 @@
+"""SQLite application tracking database using SQLAlchemy."""
+
+from __future__ import annotations
+
+import json
+import os
+from datetime import datetime, timezone
+from typing import Optional
+
+from sqlalchemy import (
+    Column,
+    DateTime,
+    Float,
+    Integer,
+    String,
+    Text,
+    Boolean,
+    create_engine,
+)
+from sqlalchemy.orm import DeclarativeBase, Session, scoped_session, sessionmaker
+
+
+def _utcnow() -> datetime:
+    """Return current UTC datetime (timezone-aware)."""
+    return datetime.now(timezone.utc)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class ApplicationRecord(Base):
+    """Tracks every job application through the pipeline."""
+
+    __tablename__ = "applications"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+
+    # Job info
+    job_title = Column(String(500), nullable=False)
+    company = Column(String(300), nullable=False)
+    location = Column(String(300), default="")
+    job_url = Column(String(2000), default="", unique=True)
+    source = Column(String(100), default="")  # LinkedIn, Indeed, etc.
+    description = Column(Text, default="")
+    is_remote = Column(Boolean, default=False)
+
+    # Salary info
+    salary_min = Column(Float, nullable=True)
+    salary_max = Column(Float, nullable=True)
+    estimated_total_comp = Column(String(200), default="")
+
+    # Scoring
+    overall_score = Column(Float, nullable=True)
+    technical_score = Column(Float, nullable=True)
+    leadership_score = Column(Float, nullable=True)
+    platform_building_score = Column(Float, nullable=True)
+    comp_potential_score = Column(Float, nullable=True)
+    company_trajectory_score = Column(Float, nullable=True)
+    culture_fit_score = Column(Float, nullable=True)
+    recommendation = Column(String(50), default="")  # STRONG_APPLY, APPLY, MAYBE, SKIP
+    score_reasoning = Column(Text, default="")
+    key_strengths = Column(Text, default="")  # JSON array
+    key_gaps = Column(Text, default="")  # JSON array
+
+    # Company intel
+    funding_stage = Column(String(100), nullable=True)
+    total_funding = Column(String(100), nullable=True)
+    employee_count = Column(String(100), nullable=True)
+    company_intel_json = Column(Text, default="")  # Full CompanyIntel as JSON
+
+    # Application materials
+    resume_tweaks_json = Column(Text, default="")  # ResumeOptimization as JSON
+    cover_letter = Column(Text, default="")
+
+    # Status tracking
+    status = Column(String(50), default="found")
+    date_found = Column(DateTime, default=_utcnow)
+    date_applied = Column(DateTime, nullable=True)
+    date_response = Column(DateTime, nullable=True)
+
+    # Notes
+    notes = Column(Text, default="")
+    contact_name = Column(String(300), default="")
+    contact_email = Column(String(300), default="")
+    referral_source = Column(String(300), default="")
+
+    # Timestamps
+    created_at = Column(DateTime, default=_utcnow)
+    updated_at = Column(DateTime, default=_utcnow, onupdate=_utcnow)
+
+    def __repr__(self) -> str:
+        return f"<Application {self.company} - {self.job_title} ({self.status})>"
+
+    @property
+    def strengths_list(self) -> list[str]:
+        if self.key_strengths:
+            try:
+                return json.loads(self.key_strengths)
+            except json.JSONDecodeError:
+                return []
+        return []
+
+    @property
+    def gaps_list(self) -> list[str]:
+        if self.key_gaps:
+            try:
+                return json.loads(self.key_gaps)
+            except json.JSONDecodeError:
+                return []
+        return []
+
+
+# Database connection management
+
+_engine = None
+_SessionLocal = None
+
+DB_PATH = os.path.join(
+    os.getenv("JOB_FINDER_DATA_DIR", os.path.join(os.getcwd(), "data")),
+    "job_tracker.db",
+)
+
+
+def init_db(db_path: str | None = None) -> None:
+    """Initialize the database and create tables."""
+    global _engine, _SessionLocal
+
+    path = db_path or DB_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    _engine = create_engine(
+        f"sqlite:///{path}",
+        echo=False,
+        connect_args={"check_same_thread": False},
+    )
+    Base.metadata.create_all(_engine)
+    _SessionLocal = scoped_session(sessionmaker(bind=_engine))
+
+
+def get_session() -> Session:
+    """Get a database session."""
+    if _SessionLocal is None:
+        init_db()
+    return _SessionLocal()
+
+
+def save_application(
+    job_title: str,
+    company: str,
+    location: str = "",
+    job_url: str = "",
+    source: str = "",
+    description: str = "",
+    is_remote: bool = False,
+    salary_min: float | None = None,
+    salary_max: float | None = None,
+    overall_score: float | None = None,
+    technical_score: float | None = None,
+    leadership_score: float | None = None,
+    platform_building_score: float | None = None,
+    comp_potential_score: float | None = None,
+    recommendation: str = "",
+    score_reasoning: str = "",
+    key_strengths: list[str] | None = None,
+    key_gaps: list[str] | None = None,
+    funding_stage: str | None = None,
+    cover_letter: str = "",
+    resume_tweaks_json: str = "",
+    notes: str = "",
+) -> ApplicationRecord | None:
+    """Save a new application record to the database. Returns None if duplicate URL."""
+    session = get_session()
+    try:
+        # Skip duplicates by URL
+        if job_url:
+            existing = session.query(ApplicationRecord).filter_by(job_url=job_url).first()
+            if existing:
+                return existing
+
+        record = ApplicationRecord(
+            job_title=job_title,
+            company=company,
+            location=location,
+            job_url=job_url,
+            source=source,
+            description=description,
+            is_remote=is_remote,
+            salary_min=salary_min,
+            salary_max=salary_max,
+            overall_score=overall_score,
+            technical_score=technical_score,
+            leadership_score=leadership_score,
+            platform_building_score=platform_building_score,
+            comp_potential_score=comp_potential_score,
+            recommendation=recommendation,
+            score_reasoning=score_reasoning,
+            key_strengths=json.dumps(key_strengths or []),
+            key_gaps=json.dumps(key_gaps or []),
+            funding_stage=funding_stage,
+            cover_letter=cover_letter,
+            resume_tweaks_json=resume_tweaks_json,
+            notes=notes,
+        )
+        session.add(record)
+        session.commit()
+        session.refresh(record)
+        session.expunge(record)
+        return record
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def update_application_status(
+    application_id: int,
+    status: str,
+    notes: str | None = None,
+) -> ApplicationRecord | None:
+    """Update the status of an application."""
+    session = get_session()
+    try:
+        record = session.query(ApplicationRecord).filter_by(id=application_id).first()
+        if record:
+            record.status = status
+            record.updated_at = _utcnow()
+            if status == "applied":
+                record.date_applied = _utcnow()
+            if notes:
+                existing = record.notes or ""
+                timestamp = _utcnow().strftime("%Y-%m-%d %H:%M")
+                record.notes = f"{existing}\n[{timestamp}] {notes}".strip()
+            session.commit()
+            session.refresh(record)
+            session.expunge(record)
+        return record
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+def get_all_applications(
+    status: str | None = None,
+    min_score: float | None = None,
+) -> list[ApplicationRecord]:
+    """Retrieve applications with optional filters."""
+    session = get_session()
+    try:
+        query = session.query(ApplicationRecord)
+        if status:
+            query = query.filter(ApplicationRecord.status == status)
+        if min_score is not None:
+            query = query.filter(ApplicationRecord.overall_score >= min_score)
+        results = query.order_by(ApplicationRecord.overall_score.desc()).all()
+        session.expunge_all()
+        return results
+    finally:
+        session.close()
